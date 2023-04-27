@@ -1,14 +1,20 @@
 import functools
 import os
+from datetime import datetime
 from tempfile import TemporaryFile
 import timeit
 from PIL import Image
 import itertools
 
+import pandas
+from dotenv import load_dotenv
+
 from imaginex_lambda.lib.img_lib import optimize_image
 from imaginex_lambda.lib.utils import logger, get_extension
 
-NINJA_API_KEY = ''
+load_dotenv()
+
+NINJA_API_KEY = os.getenv('NINJA_API_KEY')
 
 BENCHMARK = {
     'number_of_tests': 0,
@@ -35,57 +41,70 @@ if __name__ == '__main__':
 
     logger.info("Running benchmark...")
 
-    quality = 100
-    width = 100
-
     RESULTS = []
 
-    with TemporaryFile() as tmp_buffer:
-        or_width_options = [4096, 2048, 1024, 512]
-        q_options = [100, 75, 50, 25]
-        scale_options = [100, 75, 50, 25]
+    or_width_options = [2048, 1024, 512, 256]
+    q_options = [100, 75, 50, 25]
+    scale_options = [100, 75, 50, 25]
+    format_options = ['JPEG', 'PNG', 'GIF']
+    calls = 1
+    for img_format in format_options:
+        BENCHMARK_CSV = []
         for or_width in or_width_options:
-            generate_image(tmp_buffer, api_key=NINJA_API_KEY, w=or_width, h=or_width)
-            tmp_buffer.flush()
-            img = Image.open(tmp_buffer)
-            mime = get_extension(tmp_buffer)
-            content_type = mime['content_type']
-            extension = mime['extension']
-            run_dict = {
-                'original_size': os.stat(tmp_buffer.name).st_size,
-                'original_width': or_width,
-                'original_height': or_width,
-                'img_format': extension,
-                'results': []
-            }
+            with TemporaryFile() as tmp_buffer:
+                generate_image(tmp_buffer, api_key=NINJA_API_KEY, w=or_width, h=or_width)
+                tmp_buffer.flush()
 
-            for q, scale in itertools.product(q_options, scale_options):
-                requested_width = int(or_width * (scale / 100))
+                img = Image.open(tmp_buffer)
+                tmp_buffer_formatted = TemporaryFile()
+                img.save(tmp_buffer_formatted, format=img_format)
 
-                callable_fun = functools.partial(optimize_image, tmp_buffer,
-                                                 extension,
-                                                 q,
-                                                 requested_width,
-                                                 None)
+                tmp_buffer_formatted.flush()
 
-                t = timeit.Timer(callable_fun)
-                res_time = t.timeit(number=1)
+                img_formatted = Image.open(tmp_buffer_formatted)
 
-                # Check
-                image_data = callable_fun.__call__()
-
-                opt_image = Image.open(BytesIO(image_data))
-                assert opt_image.width == requested_width
-
-                run_dict_results = {
-                    'new_size': len(image_data),
-                    'req_q': q,
-                    'req_width': requested_width,
-                    'opt_height': opt_image.height,
-                    'time': res_time
+                run_dict = {
+                    'original_size': f"{os.stat(tmp_buffer_formatted.name).st_size / (1 << 20):,.5f} MB",
+                    'original_width': or_width,
+                    'original_height': or_width,
+                    'img_format': img_formatted.format,
+                    'calls': calls,
                 }
-                run_dict['results'].append(run_dict_results)
 
-                BENCHMARK['number_of_tests'] += 1
-            BENCHMARK['run'].append(run_dict)
+                for q, scale in itertools.product(q_options, scale_options):
+                    requested_width = int(or_width * (scale / 100))
+
+                    callable_fun = functools.partial(optimize_image, tmp_buffer_formatted,
+                                                     img_formatted.format,
+                                                     q,
+                                                     requested_width,
+                                                     None)
+
+                    t = timeit.Timer(callable_fun)
+                    res_time = t.timeit(number=calls)
+
+                    # Check
+                    image_data = callable_fun.__call__()
+
+                    opt_image = Image.open(BytesIO(image_data))
+                    assert opt_image.width == requested_width
+
+                    run_dict_results = {
+                        # 'new_size': len(image_data),
+                        'req_q': q,
+                        'req_width': requested_width,
+                        'opt_height': opt_image.height,
+                        'avg_time': res_time / calls,
+                        'total_time': res_time
+                    }
+
+                    csv_item = {**run_dict, **run_dict_results}
+                    BENCHMARK_CSV.append(csv_item)
+
+                tmp_buffer_formatted.close()
+
+        dataframe = pandas.DataFrame(BENCHMARK_CSV)
+        logger.info(f"Saving {img_format} results for width {requested_width}...")
+        dataframe.to_csv(f'results_{img_format}_{datetime.now().strftime("%m_%d_%Y_%H_%M")}.csv')
+
     logger.info("Benchmark ended...")
